@@ -1,0 +1,53 @@
+{
+  "watchers": {
+    "zone1": {
+      "enabled": true,
+      "sensor": "binary_sensor.your_zone1_person_detected",
+      "player": "media_player.your_zone1_speaker",
+      "start_hhmm": "2230",
+      "end_hhmm": "0600",
+      "interval_sec": 120,
+      "min_on_sec": 5,
+      "idle_poll_sec": 5,
+      "default_audio_file": "attention.aiff",
+      "default_volume": 0.6,
+      "default_media_content_type": "music",
+      "time_rules": [
+        {
+          "name": "late-night",
+          "start_hhmm": "2230",
+          "end_hhmm": "0600",
+          "audio_file": "attention.aiff",
+          "interval_sec": 120,
+          "volume": 0.6,
+          "media_content_type": "music",
+          "enabled": true
+        },
+        {
+          "name": "daytime-soft",
+          "start_hhmm": "0600",
+          "end_hhmm": "2230",
+          "audio_file": "soft-tone.aiff",
+          "interval_sec": 180,
+          "volume": 0.4,
+          "media_content_type": "music",
+          "enabled": true
+        }
+      ]
+    },
+    "zone2": {
+      "enabled": true,
+      "sensor": "binary_sensor.your_zone2_person_detected",
+      "player": "media_player.your_zone2_speaker",
+      "start_hhmm": "2230",
+      "end_hhmm": "0600",
+      "interval_sec": 120,
+      "min_on_sec": 5,
+      "idle_poll_sec": 5,
+      "default_audio_file": "attention.aiff",
+      "default_volume": 0.6,
+      "default_media_content_type": "music",
+      "time_rules": []
+    }
+  }
+}

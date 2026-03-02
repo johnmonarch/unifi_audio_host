@@ -1,0 +1,102 @@
+services:
+  alerts-http:
+    image: nginx:alpine
+    container_name: alerts-http
+    restart: unless-stopped
+    ports:
+      - "8125:80"
+    volumes:
+      - alerts_audio:/usr/share/nginx/html:ro
+
+  alerts-files:
+    image: filebrowser/filebrowser:latest
+    container_name: alerts-files
+    restart: unless-stopped
+    command:
+      - --address
+      - 0.0.0.0
+      - --port
+      - "80"
+      - --root
+      - /srv
+      - --database
+      - /config/database.db
+      - --config
+      - /config/settings.json
+    ports:
+      - "8126:80"
+    volumes:
+      - alerts_audio:/srv
+      - filebrowser_data:/config
+
+  alerts-admin:
+    image: ${ALERTS_ADMIN_IMAGE:-ghcr.io/your-github-user/unifi-alerts-admin:latest}
+    container_name: alerts-admin
+    restart: unless-stopped
+    ports:
+      - "8127:8127"
+    environment:
+      TZ: ${TZ}
+      CONFIG_FILE: /config/alerts.json
+      RUNTIME_CONFIG_FILE: /config/runtime.json
+      AUDIO_DIR: /audio
+      WATCHER_NAMES: ${WATCHER_NAMES}
+      ALERT_URL_BASE: ${ALERT_URL_BASE}
+      FILE_MANAGER_URL: ${FILE_MANAGER_URL}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      HA_BASE_URL: ${HA_BASE_URL}
+      HA_TOKEN: ${HA_TOKEN}
+      ZONE1_ALERT_SENSOR: ${ZONE1_ALERT_SENSOR}
+      ZONE1_ALERT_PLAYER: ${ZONE1_ALERT_PLAYER}
+      ZONE1_ALERT_URL: ${ZONE1_ALERT_URL}
+      ZONE1_ALERT_START_HHMM: ${ZONE1_ALERT_START_HHMM}
+      ZONE1_ALERT_END_HHMM: ${ZONE1_ALERT_END_HHMM}
+      ZONE1_ALERT_INTERVAL_SEC: ${ZONE1_ALERT_INTERVAL_SEC}
+      ZONE1_ALERT_MIN_ON_SEC: ${ZONE1_ALERT_MIN_ON_SEC}
+      ZONE1_ALERT_IDLE_POLL_SEC: ${ZONE1_ALERT_IDLE_POLL_SEC}
+      ZONE1_ALERT_VOLUME: ${ZONE1_ALERT_VOLUME}
+      ZONE1_ALERT_MEDIA_CONTENT_TYPE: ${ZONE1_ALERT_MEDIA_CONTENT_TYPE}
+      ZONE2_ALERT_SENSOR: ${ZONE2_ALERT_SENSOR}
+      ZONE2_ALERT_PLAYER: ${ZONE2_ALERT_PLAYER}
+      ZONE2_ALERT_URL: ${ZONE2_ALERT_URL}
+      ZONE2_ALERT_START_HHMM: ${ZONE2_ALERT_START_HHMM}
+      ZONE2_ALERT_END_HHMM: ${ZONE2_ALERT_END_HHMM}
+      ZONE2_ALERT_INTERVAL_SEC: ${ZONE2_ALERT_INTERVAL_SEC}
+      ZONE2_ALERT_MIN_ON_SEC: ${ZONE2_ALERT_MIN_ON_SEC}
+      ZONE2_ALERT_IDLE_POLL_SEC: ${ZONE2_ALERT_IDLE_POLL_SEC}
+      ZONE2_ALERT_VOLUME: ${ZONE2_ALERT_VOLUME}
+      ZONE2_ALERT_MEDIA_CONTENT_TYPE: ${ZONE2_ALERT_MEDIA_CONTENT_TYPE}
+    volumes:
+      - alerts_config:/config
+      - alerts_audio:/audio:ro
+
+  watch-zones:
+    image: ${ALERTS_WATCHER_IMAGE:-ghcr.io/your-github-user/unifi-alerts-watcher:latest}
+    container_name: watch-zones
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ}
+      HA_BASE_URL: ${HA_BASE_URL}
+      HA_TOKEN: ${HA_TOKEN}
+      RUNTIME_CONFIG_FILE: /config/runtime.json
+      WATCHER_NAMES: ${WATCHER_NAMES}
+      CONFIG_FILE: /config/alerts.json
+      ALERT_URL_BASE: ${ALERT_URL_BASE}
+      ALERT_SENSOR: ${ALERT_SENSOR}
+      ALERT_PLAYER: ${ALERT_PLAYER}
+      ALERT_URL: ${ALERT_URL}
+      ALERT_START_HHMM: ${ALERT_START_HHMM}
+      ALERT_END_HHMM: ${ALERT_END_HHMM}
+      ALERT_INTERVAL_SEC: ${ALERT_INTERVAL_SEC}
+      ALERT_MIN_ON_SEC: ${ALERT_MIN_ON_SEC}
+      ALERT_IDLE_POLL_SEC: ${ALERT_IDLE_POLL_SEC}
+      ALERT_VOLUME: ${ALERT_VOLUME}
+      ALERT_MEDIA_CONTENT_TYPE: ${ALERT_MEDIA_CONTENT_TYPE}
+    volumes:
+      - alerts_config:/config:ro
+
+volumes:
+  alerts_audio:
+  alerts_config:
+  filebrowser_data:

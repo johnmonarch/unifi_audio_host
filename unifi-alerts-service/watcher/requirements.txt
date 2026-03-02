@@ -1,0 +1,1 @@
+# stdlib-only watcher; no external Python dependencies required.
