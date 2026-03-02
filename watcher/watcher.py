@@ -11,15 +11,24 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def clean_env_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if text == "$":
+        return ""
+    if text.startswith("${") and text.endswith("}"):
+        return ""
+    return text
+
+
 def env_required(name: str) -> str:
-    value = os.getenv(name, "").strip()
+    value = clean_env_value(os.getenv(name, ""))
     if not value:
         raise ValueError(f"Missing required env var: {name}")
     return value
 
 
 def env_optional(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
+    return clean_env_value(os.getenv(name, default))
 
 
 def parse_int(value: Any, default: int) -> int:
@@ -154,9 +163,8 @@ class HAClient:
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-
-        req = urllib.request.Request(url=url, method=method, data=body, headers=headers)
         try:
+            req = urllib.request.Request(url=url, method=method, data=body, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
                 try:
