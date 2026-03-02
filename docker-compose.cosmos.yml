@@ -30,7 +30,7 @@ services:
       - filebrowser_data:/config
 
   alerts-admin:
-    image: ${ALERTS_ADMIN_IMAGE:-ghcr.io/your-github-user/unifi-alerts-admin:latest}
+    image: ghcr.io/johnmonarch/unifi-alerts-admin:latest
     container_name: alerts-admin
     restart: unless-stopped
     ports:
@@ -72,7 +72,7 @@ services:
       - alerts_audio:/audio:ro
 
   watch-zones:
-    image: ${ALERTS_WATCHER_IMAGE:-ghcr.io/your-github-user/unifi-alerts-watcher:latest}
+    image: ghcr.io/johnmonarch/unifi-alerts-watcher:latest
     container_name: watch-zones
     restart: unless-stopped
     environment:
