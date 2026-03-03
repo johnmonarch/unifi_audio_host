@@ -732,6 +732,9 @@ def page_style() -> str:
     .subtle-actions button {
       background: #2a5678;
     }
+    .subtle-actions button.danger {
+      background: #8b2f2f;
+    }
     details {
       margin-top: 8px;
       border-top: 1px dashed var(--line);
@@ -883,6 +886,7 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
         if audio_files
         else "<p class=\"muted\">No audio files uploaded yet.</p>"
     )
+    fixed_watcher_names = {name.strip().lower() for name in WATCHER_NAMES if name.strip()}
 
     cards: List[str] = []
     for watcher_name, cfg in watchers.items():
@@ -894,10 +898,22 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
         selected_audio = "" if custom_audio_url else current_audio
         start_clock = hhmm_to_clock(str(cfg.get("start_hhmm", "2230")), "22:30")
         end_clock = hhmm_to_clock(str(cfg.get("end_hhmm", "0600")), "06:00")
+        zone_delete_controls = (
+            '<p class="helper">Core zone from WATCHER_NAMES. Remove it from environment to delete.</p>'
+            if watcher_name in fixed_watcher_names
+            else (
+                '<div class="subtle-actions">'
+                f'<button type="submit" class="danger" formaction="/delete-zone" formmethod="post" '
+                f'name="delete_zone" value="{safe_name}" '
+                f'onclick="return confirm(\'Delete zone {safe_name}?\');">Delete Zone</button>'
+                "</div>"
+            )
+        )
         card = f"""
         <section class="card">
           <h2>{html.escape(watcher_name)}</h2>
           <p class="muted">Pick trigger, speaker, time window, then run a test.</p>
+          {zone_delete_controls}
           <label class="chip"><input type="checkbox" name="{safe_name}__enabled" {checked}/> Enabled</label>
 
           <p class="step-title">Step 1 - Trigger Sensor</p>
@@ -927,6 +943,9 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
           <p class="step-title">Step 4 - Test</p>
           <div class="subtle-actions">
             <button type="submit" name="test_zone" value="{safe_name}">Save + Test Audio</button>
+            <button type="submit" formaction="/test-zone" formmethod="post" name="test_zone" value="{safe_name}">
+              Test Saved (No Save)
+            </button>
           </div>
 
           <details>
@@ -1011,7 +1030,7 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
     {f'<div class="notice">{escaped_notice}</div>' if escaped_notice else ''}
     <section class="help">
       <p class="muted"><strong>Quick Flow</strong></p>
-      <p class="muted">1) Drag/upload audio. 2) Pick trigger sensor + speaker. 3) Set start/end with clock picker. 4) Click Save + Test Audio.</p>
+      <p class="muted">1) Drag/upload audio. 2) Pick trigger sensor + speaker. 3) Set start/end with clock picker. 4) Click Save + Test Audio, or Test Saved (No Save).</p>
     </section>
     <section class="help">
       <p class="muted"><strong>Step 1: Drag + Upload Audio</strong></p>
@@ -1301,6 +1320,64 @@ class AdminHandler(BaseHTTPRequestHandler):
                     self._send_html(render_dashboard(message=f"Failed to add zone: {exc}"), status=500)
                     return
                 self._redirect(f"/?msg=Added+zone:+{urllib.parse.quote(new_zone_name)}")
+                return
+
+            if parsed.path == "/delete-zone":
+                delete_zone = form.get("delete_zone", [""])[0].strip().lower()
+                if delete_zone == "":
+                    delete_zone = form.get("zone_name", [""])[0].strip().lower()
+                if not zone_name_valid(delete_zone):
+                    self._redirect("/?warn=Invalid+zone+name")
+                    return
+
+                fixed_watcher_names = {name.strip().lower() for name in WATCHER_NAMES if name.strip()}
+                if delete_zone in fixed_watcher_names:
+                    self._redirect(
+                        f"/?warn={urllib.parse.quote(delete_zone + ' is defined by WATCHER_NAMES and cannot be deleted here')}"
+                    )
+                    return
+
+                current_payload, _ = read_alerts_config()
+                watchers = current_payload.get("watchers", {})
+                if not isinstance(watchers, dict):
+                    watchers = {}
+                zone_lookup = {
+                    str(zone_name).strip().lower(): zone_name
+                    for zone_name in watchers.keys()
+                    if str(zone_name).strip()
+                }
+                original_key = zone_lookup.get(delete_zone)
+                if original_key is None:
+                    self._redirect(f"/?warn=Zone+not+found:+{urllib.parse.quote(delete_zone)}")
+                    return
+                del watchers[original_key]
+                try:
+                    write_alerts_config({"watchers": watchers})
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._send_html(render_dashboard(message=f"Failed to delete zone: {exc}"), status=500)
+                    return
+                self._redirect(f"/?msg=Deleted+zone:+{urllib.parse.quote(delete_zone)}")
+                return
+
+            if parsed.path == "/test-zone":
+                runtime_settings, _ = read_runtime_settings()
+                if not runtime_settings.get("configured"):
+                    self._redirect("/onboarding?warn=Please+complete+Home+Assistant+onboarding+first")
+                    return
+                test_zone = form.get("test_zone", [""])[0].strip().lower()
+                if not test_zone:
+                    self._redirect("/?warn=Choose+a+zone+to+test")
+                    return
+
+                merged_watchers, _ = merged_alerts_config()
+                test_cfg = merged_watchers.get(test_zone)
+                if not isinstance(test_cfg, dict):
+                    self._redirect(f"/?warn={urllib.parse.quote('Unknown zone for test: ' + test_zone)}")
+                    return
+
+                ok, msg = send_test_audio(runtime_settings, test_zone, test_cfg)
+                key = "msg" if ok else "warn"
+                self._redirect(f"/?{key}={urllib.parse.quote(msg)}")
                 return
 
             if parsed.path != "/save":
