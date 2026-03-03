@@ -1339,32 +1339,37 @@ class AdminHandler(BaseHTTPRequestHandler):
             parse_errors: List[str] = []
             for watcher_name in watcher_names:
                 defaults = merged_watchers.get(watcher_name, default_watcher(watcher_name))
+                validate_zone = not test_zone or watcher_name == test_zone
 
                 def field(name: str, default: str = "") -> str:
                     return form.get(f"{watcher_name}__{name}", [default])[0].strip()
 
+                def add_parse_error(message: str) -> None:
+                    if validate_zone:
+                        parse_errors.append(message)
+
                 enabled = f"{watcher_name}__enabled" in form
                 sensor = field("sensor", str(defaults.get("sensor", "")))
                 if enabled and not sensor:
-                    parse_errors.append(f"{watcher_name}: choose a trigger sensor")
+                    add_parse_error(f"{watcher_name}: choose a trigger sensor")
                 elif enabled and sensor_entities and sensor not in sensor_entities:
-                    parse_errors.append(f"{watcher_name}: selected trigger sensor is not in current sensor list")
+                    add_parse_error(f"{watcher_name}: selected trigger sensor is not in current sensor list")
 
                 player = field("player", str(defaults.get("player", "")))
                 if enabled and not player:
-                    parse_errors.append(f"{watcher_name}: choose a speaker device")
+                    add_parse_error(f"{watcher_name}: choose a speaker device")
                 elif enabled and speaker_entities and player not in speaker_entities:
-                    parse_errors.append(f"{watcher_name}: selected player is not in current speaker device list")
+                    add_parse_error(f"{watcher_name}: selected player is not in current speaker device list")
 
                 start_raw = field("start_hhmm", hhmm_to_clock(str(defaults.get("start_hhmm", "2230")), "22:30"))
                 end_raw = field("end_hhmm", hhmm_to_clock(str(defaults.get("end_hhmm", "0600")), "06:00"))
                 start_hhmm = hhmm_from_input(start_raw)
                 end_hhmm = hhmm_from_input(end_raw)
                 if not start_hhmm:
-                    parse_errors.append(f"{watcher_name}: invalid start time '{start_raw}'")
+                    add_parse_error(f"{watcher_name}: invalid start time '{start_raw}'")
                     start_hhmm = hhmm_from_input(str(defaults.get("start_hhmm", "2230"))) or "2230"
                 if not end_hhmm:
-                    parse_errors.append(f"{watcher_name}: invalid end time '{end_raw}'")
+                    add_parse_error(f"{watcher_name}: invalid end time '{end_raw}'")
                     end_hhmm = hhmm_from_input(str(defaults.get("end_hhmm", "0600"))) or "0600"
 
                 interval_sec = max(1, parse_int(field("interval_sec", str(defaults.get("interval_sec", 120))), 120))
@@ -1389,18 +1394,18 @@ class AdminHandler(BaseHTTPRequestHandler):
                     if not isinstance(time_rules, list):
                         raise ValueError("time_rules_json must be a JSON array")
                 except Exception as exc:  # pylint: disable=broad-except
-                    parse_errors.append(f"{watcher_name}: invalid time_rules_json ({exc})")
+                    add_parse_error(f"{watcher_name}: invalid time_rules_json ({exc})")
                     time_rules = []
 
                 normalized_rules: List[Dict[str, Any]] = []
                 for idx, rule in enumerate(time_rules):
                     if not isinstance(rule, dict):
-                        parse_errors.append(f"{watcher_name}: rule {idx + 1} is not an object")
+                        add_parse_error(f"{watcher_name}: rule {idx + 1} is not an object")
                         continue
                     rs = str(rule.get("start_hhmm", "")).strip()
                     re = str(rule.get("end_hhmm", "")).strip()
                     if not (hhmm_valid(rs) and hhmm_valid(re)):
-                        parse_errors.append(f"{watcher_name}: rule {idx + 1} has invalid HHMM window")
+                        add_parse_error(f"{watcher_name}: rule {idx + 1} has invalid HHMM window")
                         continue
                     normalized_rules.append(
                         {
