@@ -86,6 +86,27 @@ def hhmm_valid(value: str) -> bool:
     return 0 <= hour <= 23 and 0 <= minute <= 59
 
 
+def hhmm_from_input(value: str) -> str:
+    text = str(value or "").strip()
+    if hhmm_valid(text):
+        return text
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return ""
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return ""
+    return f"{hour:02d}{minute:02d}"
+
+
+def hhmm_to_clock(value: str, fallback: str = "00:00") -> str:
+    normalized = hhmm_from_input(value)
+    if not normalized:
+        return fallback
+    return f"{normalized[:2]}:{normalized[2:]}"
+
+
 def zone_name_valid(value: str) -> bool:
     return re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", value.strip().lower()) is not None
 
@@ -191,15 +212,16 @@ def ha_get_states(ha_base_url: str, ha_token: str) -> Tuple[List[Dict[str, Any]]
     return out, ""
 
 
-def discover_speaker_players(runtime_settings: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str]:
+def discover_states(runtime_settings: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
     runtime_payload, _ = read_runtime_raw()
     base_url = str(runtime_settings.get("base_url", "")).strip().rstrip("/")
     token = env_optional("HA_TOKEN", "") or str(runtime_payload.get("ha_token", "")).strip()
-    states, err = ha_get_states(base_url, token)
-    if err:
-        return [], err
+    return ha_get_states(base_url, token)
 
+
+def discover_speaker_players_from_states(states: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     unifi_candidates: List[Dict[str, str]] = []
+    fallback_candidates: List[Dict[str, str]] = []
     seen = set()
     for row in states:
         entity_id = str(row.get("entity_id", "")).strip()
@@ -223,15 +245,63 @@ def discover_speaker_players(runtime_settings: Dict[str, Any]) -> Tuple[List[Dic
         label = friendly_name or entity_id
         candidate = {"entity_id": entity_id, "label": f"{label} ({entity_id})"}
 
-        unifi_haystack = " ".join([entity_id, friendly_name, attribution, manufacturer]).lower()
-        if "unifi" in unifi_haystack:
+        if "unifi" in haystack:
             unifi_candidates.append(candidate)
+        else:
+            fallback_candidates.append(candidate)
 
     unifi_candidates.sort(key=lambda item: item["label"].lower())
+    fallback_candidates.sort(key=lambda item: item["label"].lower())
+    return unifi_candidates or fallback_candidates
 
-    if not unifi_candidates:
-        return [], "No UniFi Protect speaker media_player devices were discovered in Home Assistant."
-    return unifi_candidates, ""
+
+def discover_trigger_sensors_from_states(states: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    seen = set()
+    for row in states:
+        entity_id = str(row.get("entity_id", "")).strip()
+        if not entity_id.startswith("binary_sensor."):
+            continue
+        attrs = row.get("attributes")
+        if not isinstance(attrs, dict):
+            attrs = {}
+
+        friendly_name = str(attrs.get("friendly_name", "")).strip()
+        device_class = str(attrs.get("device_class", "")).strip()
+        state = str(row.get("state", "")).strip()
+
+        if entity_id in seen:
+            continue
+        seen.add(entity_id)
+
+        details = f"state: {state}" if state else "state: unknown"
+        if device_class:
+            details = f"{device_class}, {details}"
+        label = friendly_name or entity_id
+        candidates.append({"entity_id": entity_id, "label": f"{label} ({entity_id}) [{details}]"})
+
+    candidates.sort(key=lambda item: item["label"].lower())
+    return candidates
+
+
+def discover_speaker_players(runtime_settings: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str]:
+    states, err = discover_states(runtime_settings)
+    if err:
+        return [], err
+    players = discover_speaker_players_from_states(states)
+    if not players:
+        return [], "No speaker media_player devices were discovered in Home Assistant."
+    return players, ""
+
+
+def discover_trigger_sensors(runtime_settings: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str]:
+    states, err = discover_states(runtime_settings)
+    if err:
+        return [], err
+    sensors = discover_trigger_sensors_from_states(states)
+    if not sensors:
+        return [], "No binary_sensor entities were discovered in Home Assistant."
+    return sensors, ""
 
 
 def infer_audio_file(url: str) -> str:
@@ -275,6 +345,90 @@ def resolve_audio_abs_path(rel_path: str) -> str:
     if abs_path != base and not abs_path.startswith(base + os.sep):
         raise ValueError("Invalid audio file path")
     return abs_path
+
+
+def build_media_url(audio_or_url: str, fallback_url: str) -> str:
+    raw = str(audio_or_url or "").strip()
+    if raw == "":
+        return fallback_url
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    if not ALERT_URL_BASE:
+        return raw
+    encoded = "/".join(urllib.parse.quote(part) for part in raw.lstrip("/").split("/") if part)
+    if not encoded:
+        return fallback_url
+    return f"{ALERT_URL_BASE}/{encoded}"
+
+
+def runtime_ha_credentials(runtime_settings: Dict[str, Any]) -> Tuple[str, str]:
+    runtime_payload, _ = read_runtime_raw()
+    base_url = str(runtime_settings.get("base_url", "")).strip().rstrip("/")
+    token = env_optional("HA_TOKEN", "") or str(runtime_payload.get("ha_token", "")).strip()
+    return base_url, token
+
+
+def ha_post_service(ha_base_url: str, ha_token: str, service_path: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
+    if not ha_base_url or not ha_token:
+        return False, "Home Assistant is not configured."
+
+    url = f"{ha_base_url.rstrip('/')}{service_path}"
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url=url,
+        method="POST",
+        data=body,
+        headers={"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HA_API_TIMEOUT_SEC):
+            return True, ""
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return False, f"HTTP {exc.code}: {detail}"
+    except urllib.error.URLError as exc:
+        return False, f"connection error: {exc.reason}"
+    except Exception as exc:  # pylint: disable=broad-except
+        return False, f"request error: {exc}"
+
+
+def send_test_audio(runtime_settings: Dict[str, Any], watcher_name: str, watcher_cfg: Dict[str, Any]) -> Tuple[bool, str]:
+    player = str(watcher_cfg.get("player", "")).strip()
+    media_url = str(watcher_cfg.get("url", "")).strip()
+    media_content_type = str(watcher_cfg.get("default_media_content_type", "music")).strip() or "music"
+    volume = parse_float_optional(watcher_cfg.get("default_volume"), None)
+    if volume is not None:
+        volume = max(0.0, min(1.0, volume))
+
+    if not player:
+        return False, f"{watcher_name}: choose a speaker before testing"
+    if not media_url:
+        return False, f"{watcher_name}: choose an audio file before testing"
+
+    ha_base_url, ha_token = runtime_ha_credentials(runtime_settings)
+    if volume is not None:
+        ok, err = ha_post_service(
+            ha_base_url,
+            ha_token,
+            "/api/services/media_player/volume_set",
+            {"entity_id": player, "volume_level": volume},
+        )
+        if not ok:
+            return False, f"{watcher_name}: test volume_set failed ({err})"
+
+    ok, err = ha_post_service(
+        ha_base_url,
+        ha_token,
+        "/api/services/media_player/play_media",
+        {
+            "entity_id": player,
+            "media_content_id": media_url,
+            "media_content_type": media_content_type,
+        },
+    )
+    if not ok:
+        return False, f"{watcher_name}: test play_media failed ({err})"
+    return True, f"{watcher_name}: test audio sent to {player}"
 
 
 def default_watcher(name: str) -> Dict[str, Any]:
@@ -370,11 +524,11 @@ def html_input(name: str, value: Any, input_type: str = "text", step: str = "") 
     return f'<input type="{input_type}" name="{name}" value="{escaped}"{step_part} />'
 
 
-def html_speaker_select(name: str, selected: str, options: List[Dict[str, str]]) -> str:
+def html_entity_select(name: str, selected: str, options: List[Dict[str, str]], empty_label: str) -> str:
     escaped_name = html.escape(name, quote=True)
     selected_value = (selected or "").strip()
     rows: List[str] = [f'<select name="{escaped_name}">']
-    rows.append('<option value="">-- Select a speaker device --</option>')
+    rows.append(f'<option value="">{html.escape(empty_label)}</option>')
 
     for opt in options:
         entity_id = opt.get("entity_id", "")
@@ -387,6 +541,25 @@ def html_speaker_select(name: str, selected: str, options: List[Dict[str, str]])
         )
 
     if selected_value and all(opt.get("entity_id") != selected_value for opt in options):
+        rows.append(
+            f'<option value="{html.escape(selected_value, quote=True)}" selected>'
+            f"{html.escape(selected_value)} (current value)</option>"
+        )
+    rows.append("</select>")
+    return "\n".join(rows)
+
+
+def html_audio_select(name: str, selected: str, options: List[str]) -> str:
+    escaped_name = html.escape(name, quote=True)
+    selected_value = (selected or "").strip()
+    rows: List[str] = [f'<select name="{escaped_name}">']
+    rows.append('<option value="">-- Select an uploaded audio file --</option>')
+
+    for path in options:
+        selected_attr = " selected" if path == selected_value else ""
+        rows.append(f'<option value="{html.escape(path, quote=True)}"{selected_attr}>{html.escape(path)}</option>')
+
+    if selected_value and selected_value not in options:
         rows.append(
             f'<option value="{html.escape(selected_value, quote=True)}" selected>'
             f"{html.escape(selected_value)} (current value)</option>"
@@ -473,7 +646,7 @@ def page_style() -> str:
       font-size: 0.9rem;
       font-weight: 600;
     }
-    input, textarea {
+    input, textarea, select {
       width: 100%;
       box-sizing: border-box;
       border: 1px solid var(--line);
@@ -524,6 +697,80 @@ def page_style() -> str:
       color: var(--accent);
       text-decoration: none;
       font-weight: 600;
+    }
+    .step-title {
+      margin-top: 2px;
+      margin-bottom: 0;
+      font-size: 0.86rem;
+      font-weight: 700;
+      color: #35566f;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .time-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      border: 1px solid #cddbe5;
+      border-radius: 999px;
+      background: #f3f8fb;
+      padding: 5px 10px;
+      font-size: 0.88rem;
+      color: #375367;
+    }
+    .subtle-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .subtle-actions button {
+      background: #2a5678;
+    }
+    details {
+      margin-top: 8px;
+      border-top: 1px dashed var(--line);
+      padding-top: 8px;
+    }
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+      color: #35566f;
+      margin-bottom: 8px;
+    }
+    .dropzone {
+      display: block;
+      border: 2px dashed #8eb2ce;
+      background: #f3f8fc;
+      border-radius: 12px;
+      padding: 18px 14px;
+      text-align: center;
+      color: #2a5678;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .dropzone.dragover {
+      border-color: #1f6fb2;
+      background: #e7f2fc;
+    }
+    .dropzone input[type="file"] {
+      display: none;
+    }
+    .helper {
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin: 0;
+    }
+    @media (max-width: 640px) {
+      .time-grid {
+        grid-template-columns: 1fr;
+      }
     }
     button {
       border: 0;
@@ -590,18 +837,29 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
     watchers, load_warning = merged_alerts_config()
     runtime_settings, runtime_warn = read_runtime_settings()
     audio_files = list_audio_files()
-    speaker_options, speaker_error = discover_speaker_players(runtime_settings)
+    states, discovery_error = discover_states(runtime_settings)
+    speaker_options: List[Dict[str, str]] = []
+    sensor_options: List[Dict[str, str]] = []
+    speaker_error = ""
+    sensor_error = ""
+    if discovery_error:
+        speaker_error = discovery_error
+        sensor_error = discovery_error
+    else:
+        speaker_options = discover_speaker_players_from_states(states)
+        sensor_options = discover_trigger_sensors_from_states(states)
+        if not speaker_options:
+            speaker_error = "No speaker media_player devices were discovered in Home Assistant."
+        if not sensor_options:
+            sensor_error = "No binary_sensor entities were discovered in Home Assistant."
 
     notices: List[str] = []
-    for val in [message, warning, load_warning, runtime_warn, speaker_error]:
+    for val in [message, warning, load_warning, runtime_warn, speaker_error, sensor_error]:
         if val:
             notices.append(val)
     notice = " | ".join(notices)
     escaped_notice = html.escape(notice)
 
-    datalist_options = "\n".join(
-        f'<option value="{html.escape(path, quote=True)}"></option>' for path in audio_files
-    )
     audio_rows = "\n".join(
         (
             "<tr>"
@@ -629,34 +887,63 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
     cards: List[str] = []
     for watcher_name, cfg in watchers.items():
         checked = "checked" if parse_bool(cfg.get("enabled"), True) else ""
+        safe_name = html.escape(watcher_name, quote=True)
         time_rules_value = html.escape(rules_text(cfg.get("time_rules")), quote=False)
+        current_audio = str(cfg.get("default_audio_file", "")).strip()
+        custom_audio_url = current_audio if current_audio.startswith("http://") or current_audio.startswith("https://") else ""
+        selected_audio = "" if custom_audio_url else current_audio
+        start_clock = hhmm_to_clock(str(cfg.get("start_hhmm", "2230")), "22:30")
+        end_clock = hhmm_to_clock(str(cfg.get("end_hhmm", "0600")), "06:00")
         card = f"""
         <section class="card">
           <h2>{html.escape(watcher_name)}</h2>
-          <p class="muted">Trigger + player mapping for this watcher.</p>
-          <label><input type="checkbox" name="{watcher_name}__enabled" {checked}/> Enabled</label>
-          <label>Trigger Sensor Entity ID</label>
-          {html_input(f"{watcher_name}__sensor", cfg.get("sensor", ""))}
-          <label>Media Player Entity ID</label>
-          {html_speaker_select(f"{watcher_name}__player", str(cfg.get("player", "")), speaker_options)}
-          <label>Default Alert Window Start (HHMM)</label>
-          {html_input(f"{watcher_name}__start_hhmm", cfg.get("start_hhmm", "2230"))}
-          <label>Default Alert Window End (HHMM)</label>
-          {html_input(f"{watcher_name}__end_hhmm", cfg.get("end_hhmm", "0600"))}
-          <label>Default Audio File (or full URL)</label>
-          <input type="text" name="{watcher_name}__default_audio_file" value="{html.escape(str(cfg.get("default_audio_file", "")), quote=True)}" list="audio-files" />
-          <label>Default Interval Sec</label>
-          {html_input(f"{watcher_name}__interval_sec", cfg.get("interval_sec", 120), "number")}
-          <label>Min ON Sec</label>
-          {html_input(f"{watcher_name}__min_on_sec", cfg.get("min_on_sec", 5), "number")}
-          <label>Idle Poll Sec</label>
-          {html_input(f"{watcher_name}__idle_poll_sec", cfg.get("idle_poll_sec", 5), "number")}
-          <label>Default Volume (blank disables volume set)</label>
-          {html_input(f"{watcher_name}__default_volume", cfg.get("default_volume", ""), "number", "0.01")}
-          <label>Default Media Content Type</label>
-          {html_input(f"{watcher_name}__default_media_content_type", cfg.get("default_media_content_type", "music"))}
-          <label>Time Rules JSON (optional, for time-of-day sounds)</label>
-          <textarea name="{watcher_name}__time_rules_json" rows="12">{time_rules_value}</textarea>
+          <p class="muted">Pick trigger, speaker, time window, then run a test.</p>
+          <label class="chip"><input type="checkbox" name="{safe_name}__enabled" {checked}/> Enabled</label>
+
+          <p class="step-title">Step 1 - Trigger Sensor</p>
+          <label>Trigger Sensor Entity</label>
+          {html_entity_select(f"{watcher_name}__sensor", str(cfg.get("sensor", "")), sensor_options, "-- Select a trigger sensor --")}
+
+          <p class="step-title">Step 2 - Camera Speaker</p>
+          <label>Speaker Device</label>
+          {html_entity_select(f"{watcher_name}__player", str(cfg.get("player", "")), speaker_options, "-- Select a speaker device --")}
+
+          <p class="step-title">Step 3 - Time + Audio</p>
+          <div class="time-grid">
+            <div>
+              <label>Start Time</label>
+              <input type="time" name="{safe_name}__start_hhmm" value="{html.escape(start_clock, quote=True)}" />
+            </div>
+            <div>
+              <label>End Time</label>
+              <input type="time" name="{safe_name}__end_hhmm" value="{html.escape(end_clock, quote=True)}" />
+            </div>
+          </div>
+          <label>Audio File</label>
+          {html_audio_select(f"{watcher_name}__default_audio_file", selected_audio, audio_files)}
+          <label>Optional direct URL override</label>
+          <input type="text" name="{safe_name}__default_audio_url" value="{html.escape(custom_audio_url, quote=True)}" placeholder="https://... (optional)" />
+
+          <p class="step-title">Step 4 - Test</p>
+          <div class="subtle-actions">
+            <button type="submit" name="test_zone" value="{safe_name}">Save + Test Audio</button>
+          </div>
+
+          <details>
+            <summary>Advanced options</summary>
+            <label>Default Interval Sec</label>
+            {html_input(f"{watcher_name}__interval_sec", cfg.get("interval_sec", 120), "number")}
+            <label>Min ON Sec</label>
+            {html_input(f"{watcher_name}__min_on_sec", cfg.get("min_on_sec", 5), "number")}
+            <label>Idle Poll Sec</label>
+            {html_input(f"{watcher_name}__idle_poll_sec", cfg.get("idle_poll_sec", 5), "number")}
+            <label>Default Volume (blank disables volume set)</label>
+            {html_input(f"{watcher_name}__default_volume", cfg.get("default_volume", ""), "number", "0.01")}
+            <label>Default Media Content Type</label>
+            {html_input(f"{watcher_name}__default_media_content_type", cfg.get("default_media_content_type", "music"))}
+            <label>Time Rules JSON (optional, advanced)</label>
+            <textarea name="{safe_name}__time_rules_json" rows="8">{time_rules_value}</textarea>
+          </details>
         </section>
         """
         cards.append(card)
@@ -664,6 +951,41 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
     cards_html = "\n".join(cards)
     current_ha = html.escape(runtime_settings.get("base_url", ""), quote=True)
     source = html.escape(runtime_settings.get("source", "missing"), quote=True)
+    upload_script = """
+    <script>
+      (function () {
+        var input = document.getElementById("audio-file-input");
+        var zone = document.getElementById("audio-dropzone");
+        var label = document.getElementById("audio-file-label");
+        if (!input || !zone || !label) {
+          return;
+        }
+        function refreshLabel() {
+          if (input.files && input.files.length > 0) {
+            label.textContent = input.files.length === 1 ? input.files[0].name : input.files.length + " files selected";
+          } else {
+            label.textContent = "Drag an audio file here or click to browse";
+          }
+        }
+        input.addEventListener("change", refreshLabel);
+        zone.addEventListener("dragover", function (event) {
+          event.preventDefault();
+          zone.classList.add("dragover");
+        });
+        zone.addEventListener("dragleave", function () {
+          zone.classList.remove("dragover");
+        });
+        zone.addEventListener("drop", function (event) {
+          event.preventDefault();
+          zone.classList.remove("dragover");
+          if (event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+            input.files = event.dataTransfer.files;
+            refreshLabel();
+          }
+        });
+      })();
+    </script>
+    """
 
     return f"""<!doctype html>
 <html lang="en">
@@ -687,6 +1009,22 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
     </div>
     <div class="notice">HA connection: <code>{current_ha or "not configured"}</code> (source: <code>{source}</code>)</div>
     {f'<div class="notice">{escaped_notice}</div>' if escaped_notice else ''}
+    <section class="help">
+      <p class="muted"><strong>Quick Flow</strong></p>
+      <p class="muted">1) Drag/upload audio. 2) Pick trigger sensor + speaker. 3) Set start/end with clock picker. 4) Click Save + Test Audio.</p>
+    </section>
+    <section class="help">
+      <p class="muted"><strong>Step 1: Drag + Upload Audio</strong></p>
+      <form method="post" action="/upload-audio" enctype="multipart/form-data">
+        <label class="dropzone" id="audio-dropzone">
+          <input id="audio-file-input" type="file" name="audio_file" accept=".aiff,.aif,.wav,.mp3,.m4a,.ogg,audio/*" />
+          <span id="audio-file-label">Drag an audio file here or click to browse</span>
+        </label>
+        <div class="actions">
+          <button type="submit">Upload Audio</button>
+        </div>
+      </form>
+    </section>
     <form method="post" action="/add-zone">
       <div class="actions">
         <input type="text" name="new_zone_name" value="" placeholder="new zone name (example: zone3)" />
@@ -694,9 +1032,6 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
       </div>
     </form>
     <form method="post" action="/save">
-      <datalist id="audio-files">
-        {datalist_options}
-      </datalist>
       <div class="grid">
         {cards_html}
       </div>
@@ -704,45 +1039,12 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
         <button type="submit">Save Settings</button>
       </div>
     </form>
-    <section class="help">
-      <p class="muted"><strong>Quick Upload</strong></p>
-      <p class="muted">Upload audio files directly here (stored in <code>{html.escape(AUDIO_DIR)}</code>).</p>
-      <form method="post" action="/upload-audio" enctype="multipart/form-data">
-        <div class="actions">
-          <input type="file" name="audio_file" accept=".aiff,.aif,.wav,.mp3,.m4a,.ogg,audio/*" />
-          <button type="submit">Upload Audio</button>
-        </div>
-      </form>
-    </section>
     <section class="help" id="audio-library">
       <p class="muted"><strong>Audio Library</strong></p>
       <p class="muted">Browse and delete uploaded files (same login as Admin).</p>
       {audio_table}
     </section>
-    <section class="help">
-      <p class="muted"><strong>Time Rules JSON format</strong></p>
-      <p class="muted">If rules exist, alerts only play when one rule matches current time. Each rule can set a different sound for time-of-day.</p>
-      <pre><code>[
-  {{
-    "name": "night",
-    "start_hhmm": "2230",
-    "end_hhmm": "0600",
-    "audio_file": "attention.aiff",
-    "interval_sec": 120,
-    "volume": 0.6,
-    "media_content_type": "music"
-  }},
-  {{
-    "name": "day",
-    "start_hhmm": "0600",
-    "end_hhmm": "2230",
-    "audio_file": "soft-tone.aiff",
-    "interval_sec": 180,
-    "volume": 0.4,
-    "media_content_type": "music"
-  }}
-]</code></pre>
-    </section>
+    {upload_script}
   </div>
 </body>
 </html>
@@ -818,13 +1120,19 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/config":
                 watchers, warning = merged_alerts_config()
-                speaker_players, speaker_error = discover_speaker_players(runtime_settings)
+                states, discovery_error = discover_states(runtime_settings)
+                speaker_players: List[Dict[str, str]] = []
+                trigger_sensors: List[Dict[str, str]] = []
+                if not discovery_error:
+                    speaker_players = discover_speaker_players_from_states(states)
+                    trigger_sensors = discover_trigger_sensors_from_states(states)
                 payload = {
                     "watchers": watchers,
                     "audio_files": list_audio_files(),
                     "speaker_players": speaker_players,
+                    "trigger_sensors": trigger_sensors,
                     "alert_url_base": ALERT_URL_BASE,
-                    "warning": warning or speaker_error,
+                    "warning": warning or discovery_error,
                 }
                 self._send_json(payload)
                 return
@@ -1003,8 +1311,21 @@ class AdminHandler(BaseHTTPRequestHandler):
             if not runtime_settings.get("configured"):
                 self._redirect("/onboarding?warn=Please+complete+Home+Assistant+onboarding+first")
                 return
-            speaker_options, _ = discover_speaker_players(runtime_settings)
-            speaker_entities = {item.get("entity_id", "") for item in speaker_options if item.get("entity_id")}
+            test_zone = form.get("test_zone", [""])[0].strip().lower()
+            states, discovery_error = discover_states(runtime_settings)
+            speaker_entities = set()
+            sensor_entities = set()
+            if not discovery_error:
+                speaker_entities = {
+                    item.get("entity_id", "")
+                    for item in discover_speaker_players_from_states(states)
+                    if item.get("entity_id")
+                }
+                sensor_entities = {
+                    item.get("entity_id", "")
+                    for item in discover_trigger_sensors_from_states(states)
+                    if item.get("entity_id")
+                }
 
             current_payload, _ = read_alerts_config()
             existing_watchers = current_payload.get("watchers", {})
@@ -1017,25 +1338,34 @@ class AdminHandler(BaseHTTPRequestHandler):
             watchers_out: Dict[str, Any] = dict(existing_watchers)
             parse_errors: List[str] = []
             for watcher_name in watcher_names:
-                defaults = default_watcher(watcher_name)
+                defaults = merged_watchers.get(watcher_name, default_watcher(watcher_name))
 
                 def field(name: str, default: str = "") -> str:
                     return form.get(f"{watcher_name}__{name}", [default])[0].strip()
 
                 enabled = f"{watcher_name}__enabled" in form
                 sensor = field("sensor", str(defaults.get("sensor", "")))
+                if enabled and not sensor:
+                    parse_errors.append(f"{watcher_name}: choose a trigger sensor")
+                elif enabled and sensor_entities and sensor not in sensor_entities:
+                    parse_errors.append(f"{watcher_name}: selected trigger sensor is not in current sensor list")
+
                 player = field("player", str(defaults.get("player", "")))
-                if player and "speaker" not in player.lower():
-                    parse_errors.append(f"{watcher_name}: selected player must contain 'speaker'")
-                if speaker_entities and player and player not in speaker_entities:
+                if enabled and not player:
+                    parse_errors.append(f"{watcher_name}: choose a speaker device")
+                elif enabled and speaker_entities and player not in speaker_entities:
                     parse_errors.append(f"{watcher_name}: selected player is not in current speaker device list")
 
-                start_hhmm = field("start_hhmm", str(defaults.get("start_hhmm", "2230")))
-                end_hhmm = field("end_hhmm", str(defaults.get("end_hhmm", "0600")))
-                if not hhmm_valid(start_hhmm):
-                    parse_errors.append(f"{watcher_name}: invalid start_hhmm '{start_hhmm}'")
-                if not hhmm_valid(end_hhmm):
-                    parse_errors.append(f"{watcher_name}: invalid end_hhmm '{end_hhmm}'")
+                start_raw = field("start_hhmm", hhmm_to_clock(str(defaults.get("start_hhmm", "2230")), "22:30"))
+                end_raw = field("end_hhmm", hhmm_to_clock(str(defaults.get("end_hhmm", "0600")), "06:00"))
+                start_hhmm = hhmm_from_input(start_raw)
+                end_hhmm = hhmm_from_input(end_raw)
+                if not start_hhmm:
+                    parse_errors.append(f"{watcher_name}: invalid start time '{start_raw}'")
+                    start_hhmm = hhmm_from_input(str(defaults.get("start_hhmm", "2230"))) or "2230"
+                if not end_hhmm:
+                    parse_errors.append(f"{watcher_name}: invalid end time '{end_raw}'")
+                    end_hhmm = hhmm_from_input(str(defaults.get("end_hhmm", "0600"))) or "0600"
 
                 interval_sec = max(1, parse_int(field("interval_sec", str(defaults.get("interval_sec", 120))), 120))
                 min_on_sec = max(0, parse_int(field("min_on_sec", str(defaults.get("min_on_sec", 5))), 5))
@@ -1048,18 +1378,10 @@ class AdminHandler(BaseHTTPRequestHandler):
                     defaults.get("default_volume"),
                 )
 
-                default_audio_file = field("default_audio_file", str(defaults.get("default_audio_file", "")))
-                if default_audio_file.startswith("http://") or default_audio_file.startswith("https://"):
-                    url = default_audio_file
-                elif default_audio_file and ALERT_URL_BASE:
-                    encoded = "/".join(
-                        urllib.parse.quote(part) for part in default_audio_file.lstrip("/").split("/") if part
-                    )
-                    url = f"{ALERT_URL_BASE}/{encoded}" if encoded else str(defaults.get("url", ""))
-                elif default_audio_file:
-                    url = default_audio_file
-                else:
-                    url = str(defaults.get("url", ""))
+                selected_audio_file = field("default_audio_file", str(defaults.get("default_audio_file", "")))
+                audio_url_override = field("default_audio_url", "")
+                default_audio_file = audio_url_override or selected_audio_file
+                url = build_media_url(default_audio_file, str(defaults.get("url", "")))
 
                 raw_time_rules = field("time_rules_json", "[]")
                 try:
@@ -1119,6 +1441,16 @@ class AdminHandler(BaseHTTPRequestHandler):
                 write_alerts_config({"watchers": watchers_out})
             except Exception as exc:  # pylint: disable=broad-except
                 self._send_html(render_dashboard(message=f"Failed to save config: {exc}"), status=500)
+                return
+
+            if test_zone:
+                test_cfg = watchers_out.get(test_zone)
+                if not isinstance(test_cfg, dict):
+                    self._redirect(f"/?warn={urllib.parse.quote('Unknown zone for test: ' + test_zone)}")
+                    return
+                ok, msg = send_test_audio(runtime_settings, test_zone, test_cfg)
+                key = "msg" if ok else "warn"
+                self._redirect(f"/?{key}={urllib.parse.quote(msg)}")
                 return
 
             self._redirect("/?msg=Saved")
