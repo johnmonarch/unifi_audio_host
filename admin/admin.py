@@ -3,6 +3,7 @@ import base64
 import cgi
 import html
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -258,6 +259,24 @@ def list_audio_files() -> List[str]:
     return files
 
 
+def normalize_audio_rel_path(value: str) -> str:
+    raw = str(value or "").strip().replace("\\", "/").lstrip("/")
+    if raw == "":
+        raise ValueError("Audio file path is required")
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("Invalid audio file path")
+    return "/".join(parts)
+
+
+def resolve_audio_abs_path(rel_path: str) -> str:
+    base = os.path.abspath(AUDIO_DIR)
+    abs_path = os.path.abspath(os.path.join(base, rel_path))
+    if abs_path != base and not abs_path.startswith(base + os.sep):
+        raise ValueError("Invalid audio file path")
+    return abs_path
+
+
 def default_watcher(name: str) -> Dict[str, Any]:
     prefix = name.upper()
     url = env_optional(f"{prefix}_ALERT_URL", "")
@@ -482,6 +501,30 @@ def page_style() -> str:
       align-items: center;
       flex-wrap: wrap;
     }
+    .audio-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    .audio-table th, .audio-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 6px;
+      text-align: left;
+      vertical-align: middle;
+    }
+    .audio-table th {
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 0.88rem;
+    }
+    .inline-form {
+      margin: 0;
+    }
+    .linkish {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }
     button {
       border: 0;
       border-radius: 8px;
@@ -559,6 +602,29 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
     datalist_options = "\n".join(
         f'<option value="{html.escape(path, quote=True)}"></option>' for path in audio_files
     )
+    audio_rows = "\n".join(
+        (
+            "<tr>"
+            f"<td><code>{html.escape(path)}</code></td>"
+            f"<td><a class=\"linkish\" href=\"/audio-file?path={urllib.parse.quote(path, safe='')}\" target=\"_blank\" rel=\"noopener\">Open</a></td>"
+            "<td>"
+            "<form class=\"inline-form\" method=\"post\" action=\"/delete-audio\">"
+            f"<input type=\"hidden\" name=\"path\" value=\"{html.escape(path, quote=True)}\" />"
+            "<button type=\"submit\">Delete</button>"
+            "</form>"
+            "</td>"
+            "</tr>"
+        )
+        for path in audio_files
+    )
+    audio_table = (
+        "<table class=\"audio-table\">"
+        "<thead><tr><th>File</th><th>Open</th><th>Delete</th></tr></thead>"
+        f"<tbody>{audio_rows}</tbody>"
+        "</table>"
+        if audio_files
+        else "<p class=\"muted\">No audio files uploaded yet.</p>"
+    )
 
     cards: List[str] = []
     for watcher_name, cfg in watchers.items():
@@ -612,9 +678,9 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
     <div class="top">
       <h1>Unifi Alerts Admin</h1>
       <div>
-        <a href="{html.escape(FILE_MANAGER_URL, quote=True)}" target="_blank" rel="noopener">Open File Manager</a>
-        <span> | </span>
         <a href="/onboarding">HA Onboarding</a>
+        <span> | </span>
+        <a href="#audio-library">Audio Library</a>
         <span> | </span>
         <a href="/api/config" target="_blank" rel="noopener">View JSON</a>
       </div>
@@ -647,6 +713,11 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
           <button type="submit">Upload Audio</button>
         </div>
       </form>
+    </section>
+    <section class="help" id="audio-library">
+      <p class="muted"><strong>Audio Library</strong></p>
+      <p class="muted">Browse and delete uploaded files (same login as Admin).</p>
+      {audio_table}
     </section>
     <section class="help">
       <p class="muted"><strong>Time Rules JSON format</strong></p>
@@ -714,6 +785,17 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, file_path: str, display_name: str):
+        filename = os.path.basename(display_name).replace('"', "")
+        content_type = mimetypes.guess_type(display_name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(os.path.getsize(file_path)))
+        self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+        self.end_headers()
+        with open(file_path, "rb") as fh:
+            shutil.copyfileobj(fh, self.wfile)
+
     def do_GET(self):  # noqa: N802
         try:
             if not self._require_auth():
@@ -745,6 +827,20 @@ class AdminHandler(BaseHTTPRequestHandler):
                     "warning": warning or speaker_error,
                 }
                 self._send_json(payload)
+                return
+            if parsed.path == "/audio-file":
+                query = urllib.parse.parse_qs(parsed.query)
+                raw_path = query.get("path", [""])[0]
+                try:
+                    rel_path = normalize_audio_rel_path(raw_path)
+                    abs_path = resolve_audio_abs_path(rel_path)
+                except ValueError as exc:
+                    self.send_error(400, str(exc))
+                    return
+                if not os.path.isfile(abs_path):
+                    self.send_error(404, "Audio file not found")
+                    return
+                self._send_file(abs_path, rel_path)
                 return
             if parsed.path == "/onboarding":
                 query = urllib.parse.parse_qs(parsed.query)
@@ -822,6 +918,28 @@ class AdminHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(content_length).decode("utf-8", errors="replace")
             form = urllib.parse.parse_qs(body, keep_blank_values=True)
+
+            if parsed.path == "/delete-audio":
+                raw_path = form.get("path", [""])[0]
+                try:
+                    rel_path = normalize_audio_rel_path(raw_path)
+                    abs_path = resolve_audio_abs_path(rel_path)
+                except ValueError:
+                    self._redirect("/?warn=Invalid+audio+file+path")
+                    return
+                if not os.path.exists(abs_path):
+                    self._redirect(f"/?warn=Audio+file+not+found:+{urllib.parse.quote(rel_path)}")
+                    return
+                if not os.path.isfile(abs_path):
+                    self._redirect(f"/?warn=Not+a+file:+{urllib.parse.quote(rel_path)}")
+                    return
+                try:
+                    os.remove(abs_path)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._send_html(render_dashboard(message=f"Delete failed: {exc}"), status=500)
+                    return
+                self._redirect(f"/?msg=Deleted+audio:+{urllib.parse.quote(rel_path)}")
+                return
 
             if parsed.path == "/onboarding/save":
                 raw_base_url = form.get("ha_base_url", [""])[0].strip()
