@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,15 +14,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Tuple
 
 
-CONFIG_FILE = os.getenv("CONFIG_FILE", "/config/alerts.json")
-RUNTIME_CONFIG_FILE = os.getenv("RUNTIME_CONFIG_FILE", "/config/runtime.json")
-AUDIO_DIR = os.getenv("AUDIO_DIR", "/audio")
-WATCHER_NAMES = [name.strip() for name in os.getenv("WATCHER_NAMES", "zone1,zone2").split(",") if name.strip()]
-ALERT_URL_BASE = os.getenv("ALERT_URL_BASE", "").strip().rstrip("/")
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
-FILE_MANAGER_URL = os.getenv("FILE_MANAGER_URL", "http://localhost:8126").strip()
-HOST = os.getenv("ADMIN_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
+def clean_env_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if text == "$":
+        return ""
+    if text.startswith("${") and text.endswith("}"):
+        return ""
+    return text
+
+
+def env_optional(name: str, default: str = "") -> str:
+    return clean_env_value(os.getenv(name, default))
+
+
+CONFIG_FILE = env_optional("CONFIG_FILE", "/config/alerts.json")
+RUNTIME_CONFIG_FILE = env_optional("RUNTIME_CONFIG_FILE", "/config/runtime.json")
+AUDIO_DIR = env_optional("AUDIO_DIR", "/audio")
+WATCHER_NAMES = [name.strip() for name in env_optional("WATCHER_NAMES", "zone1,zone2").split(",") if name.strip()]
+if not WATCHER_NAMES:
+    WATCHER_NAMES = ["zone1", "zone2"]
+ALERT_URL_BASE = env_optional("ALERT_URL_BASE", "").rstrip("/")
+ADMIN_USERNAME = env_optional("ADMIN_USERNAME", "")
+ADMIN_PASSWORD = env_optional("ADMIN_PASSWORD", "")
+FILE_MANAGER_URL = env_optional("FILE_MANAGER_URL", "http://localhost:8126")
+HOST = env_optional("ADMIN_BIND_HOST", "0.0.0.0") or "0.0.0.0"
 PORT = int(os.getenv("ADMIN_BIND_PORT", "8127"))
 HA_API_TIMEOUT_SEC = 7
 
@@ -117,8 +133,8 @@ def read_runtime_raw() -> Tuple[Dict[str, Any], str]:
 
 
 def read_runtime_settings() -> Tuple[Dict[str, Any], str]:
-    env_base_url = os.getenv("HA_BASE_URL", "").strip().rstrip("/")
-    env_token = os.getenv("HA_TOKEN", "").strip()
+    env_base_url = env_optional("HA_BASE_URL", "").rstrip("/")
+    env_token = env_optional("HA_TOKEN", "")
 
     runtime_payload, runtime_warning = read_runtime_raw()
     runtime_base_url = str(runtime_payload.get("ha_base_url", "")).strip().rstrip("/")
@@ -175,7 +191,7 @@ def ha_get_states(ha_base_url: str, ha_token: str) -> Tuple[List[Dict[str, Any]]
 def discover_speaker_players(runtime_settings: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str]:
     runtime_payload, _ = read_runtime_raw()
     base_url = str(runtime_settings.get("base_url", "")).strip().rstrip("/")
-    token = str(os.getenv("HA_TOKEN", "")).strip() or str(runtime_payload.get("ha_token", "")).strip()
+    token = env_optional("HA_TOKEN", "") or str(runtime_payload.get("ha_token", "")).strip()
     states, err = ha_get_states(base_url, token)
     if err:
         return [], err
@@ -242,18 +258,18 @@ def list_audio_files() -> List[str]:
 
 def default_watcher(name: str) -> Dict[str, Any]:
     prefix = name.upper()
-    url = os.getenv(f"{prefix}_ALERT_URL", "").strip()
+    url = env_optional(f"{prefix}_ALERT_URL", "")
     return {
         "enabled": True,
-        "sensor": os.getenv(f"{prefix}_ALERT_SENSOR", "").strip(),
-        "player": os.getenv(f"{prefix}_ALERT_PLAYER", "").strip(),
-        "start_hhmm": os.getenv(f"{prefix}_ALERT_START_HHMM", "2230").strip(),
-        "end_hhmm": os.getenv(f"{prefix}_ALERT_END_HHMM", "0600").strip(),
-        "interval_sec": parse_int(os.getenv(f"{prefix}_ALERT_INTERVAL_SEC", "120"), 120),
-        "min_on_sec": parse_int(os.getenv(f"{prefix}_ALERT_MIN_ON_SEC", "5"), 5),
-        "idle_poll_sec": parse_int(os.getenv(f"{prefix}_ALERT_IDLE_POLL_SEC", "5"), 5),
-        "default_volume": parse_float_optional(os.getenv(f"{prefix}_ALERT_VOLUME", ""), None),
-        "default_media_content_type": os.getenv(f"{prefix}_ALERT_MEDIA_CONTENT_TYPE", "music").strip() or "music",
+        "sensor": env_optional(f"{prefix}_ALERT_SENSOR", ""),
+        "player": env_optional(f"{prefix}_ALERT_PLAYER", ""),
+        "start_hhmm": env_optional(f"{prefix}_ALERT_START_HHMM", "2230"),
+        "end_hhmm": env_optional(f"{prefix}_ALERT_END_HHMM", "0600"),
+        "interval_sec": parse_int(env_optional(f"{prefix}_ALERT_INTERVAL_SEC", "120"), 120),
+        "min_on_sec": parse_int(env_optional(f"{prefix}_ALERT_MIN_ON_SEC", "5"), 5),
+        "idle_poll_sec": parse_int(env_optional(f"{prefix}_ALERT_IDLE_POLL_SEC", "5"), 5),
+        "default_volume": parse_float_optional(env_optional(f"{prefix}_ALERT_VOLUME", ""), None),
+        "default_media_content_type": env_optional(f"{prefix}_ALERT_MEDIA_CONTENT_TYPE", "music") or "music",
         "default_audio_file": infer_audio_file(url),
         "url": url,
         "time_rules": [],
@@ -687,244 +703,260 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):  # noqa: N802
-        if not self._require_auth():
-            return
-        parsed = urllib.parse.urlparse(self.path)
-        runtime_settings, runtime_warning = read_runtime_settings()
+        try:
+            if not self._require_auth():
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            runtime_settings, runtime_warning = read_runtime_settings()
 
-        if parsed.path == "/health":
-            self._send_json({"ok": True, "time": int(time.time())})
-            return
-        if parsed.path == "/api/runtime":
-            payload = {
-                "configured": runtime_settings.get("configured", False),
-                "base_url": runtime_settings.get("base_url", ""),
-                "source": runtime_settings.get("source", "missing"),
-                "runtime_config_file": RUNTIME_CONFIG_FILE,
-                "warning": runtime_warning,
-            }
-            self._send_json(payload)
-            return
-        if parsed.path == "/api/config":
-            watchers, warning = merged_alerts_config()
-            speaker_players, speaker_error = discover_speaker_players(runtime_settings)
-            payload = {
-                "watchers": watchers,
-                "audio_files": list_audio_files(),
-                "speaker_players": speaker_players,
-                "alert_url_base": ALERT_URL_BASE,
-                "warning": warning or speaker_error,
-            }
-            self._send_json(payload)
-            return
-        if parsed.path == "/onboarding":
+            if parsed.path == "/health":
+                self._send_json({"ok": True, "time": int(time.time())})
+                return
+            if parsed.path == "/api/runtime":
+                payload = {
+                    "configured": runtime_settings.get("configured", False),
+                    "base_url": runtime_settings.get("base_url", ""),
+                    "source": runtime_settings.get("source", "missing"),
+                    "runtime_config_file": RUNTIME_CONFIG_FILE,
+                    "warning": runtime_warning,
+                }
+                self._send_json(payload)
+                return
+            if parsed.path == "/api/config":
+                watchers, warning = merged_alerts_config()
+                speaker_players, speaker_error = discover_speaker_players(runtime_settings)
+                payload = {
+                    "watchers": watchers,
+                    "audio_files": list_audio_files(),
+                    "speaker_players": speaker_players,
+                    "alert_url_base": ALERT_URL_BASE,
+                    "warning": warning or speaker_error,
+                }
+                self._send_json(payload)
+                return
+            if parsed.path == "/onboarding":
+                query = urllib.parse.parse_qs(parsed.query)
+                message = query.get("msg", [""])[0]
+                warning = query.get("warn", [""])[0]
+                self._send_html(render_onboarding(message=message, warning=warning))
+                return
+            if parsed.path != "/":
+                self.send_error(404, "Not Found")
+                return
+
+            if not runtime_settings.get("configured"):
+                self._redirect("/onboarding?warn=Home+Assistant+is+not+configured")
+                return
+
             query = urllib.parse.parse_qs(parsed.query)
             message = query.get("msg", [""])[0]
             warning = query.get("warn", [""])[0]
-            self._send_html(render_onboarding(message=message, warning=warning))
-            return
-        if parsed.path != "/":
-            self.send_error(404, "Not Found")
-            return
-
-        if not runtime_settings.get("configured"):
-            self._redirect("/onboarding?warn=Home+Assistant+is+not+configured")
-            return
-
-        query = urllib.parse.parse_qs(parsed.query)
-        message = query.get("msg", [""])[0]
-        warning = query.get("warn", [""])[0]
-        self._send_html(render_dashboard(message=message, warning=warning))
+            self._send_html(render_dashboard(message=message, warning=warning))
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} admin-error method=GET path={self.path} detail={exc}", flush=True)
+            print(traceback.format_exc(), flush=True)
+            try:
+                self._send_html(f"<h1>Internal Server Error</h1><p>{html.escape(str(exc))}</p>", status=500)
+            except Exception:
+                pass
 
     def do_POST(self):  # noqa: N802
-        if not self._require_auth():
-            return
-        parsed = urllib.parse.urlparse(self.path)
-        content_length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(content_length).decode("utf-8", errors="replace")
-        form = urllib.parse.parse_qs(body, keep_blank_values=True)
+        try:
+            if not self._require_auth():
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode("utf-8", errors="replace")
+            form = urllib.parse.parse_qs(body, keep_blank_values=True)
 
-        if parsed.path == "/onboarding/save":
-            raw_base_url = form.get("ha_base_url", [""])[0].strip()
-            raw_token = form.get("ha_token", [""])[0].strip()
-            try:
-                normalized_base_url = normalize_ha_base_url(raw_base_url)
-            except ValueError as exc:
-                self._send_html(render_onboarding(message=str(exc)), status=400)
-                return
-            if raw_token == "":
-                self._send_html(render_onboarding(message="Home Assistant token is required"), status=400)
+            if parsed.path == "/onboarding/save":
+                raw_base_url = form.get("ha_base_url", [""])[0].strip()
+                raw_token = form.get("ha_token", [""])[0].strip()
+                try:
+                    normalized_base_url = normalize_ha_base_url(raw_base_url)
+                except ValueError as exc:
+                    self._send_html(render_onboarding(message=str(exc)), status=400)
+                    return
+                if raw_token == "":
+                    self._send_html(render_onboarding(message="Home Assistant token is required"), status=400)
+                    return
+
+                payload = {
+                    "ha_base_url": normalized_base_url,
+                    "ha_token": raw_token,
+                    "saved_at_unix": int(time.time()),
+                }
+                try:
+                    write_json_atomic(RUNTIME_CONFIG_FILE, payload)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._send_html(render_onboarding(message=f"Failed to save runtime config: {exc}"), status=500)
+                    return
+                self._redirect("/?msg=Home+Assistant+onboarding+saved")
                 return
 
-            payload = {
-                "ha_base_url": normalized_base_url,
-                "ha_token": raw_token,
-                "saved_at_unix": int(time.time()),
-            }
-            try:
-                write_json_atomic(RUNTIME_CONFIG_FILE, payload)
-            except Exception as exc:  # pylint: disable=broad-except
-                self._send_html(render_onboarding(message=f"Failed to save runtime config: {exc}"), status=500)
-                return
-            self._redirect("/?msg=Home+Assistant+onboarding+saved")
-            return
+            if parsed.path == "/add-zone":
+                new_zone_name = form.get("new_zone_name", [""])[0].strip().lower()
+                if not zone_name_valid(new_zone_name):
+                    self._send_html(
+                        render_dashboard(
+                            message="Zone name must match [a-z0-9][a-z0-9_-]{0,31} (examples: zone3, side_gate)"
+                        ),
+                        status=400,
+                    )
+                    return
 
-        if parsed.path == "/add-zone":
-            new_zone_name = form.get("new_zone_name", [""])[0].strip().lower()
-            if not zone_name_valid(new_zone_name):
-                self._send_html(
-                    render_dashboard(
-                        message="Zone name must match [a-z0-9][a-z0-9_-]{0,31} (examples: zone3, side_gate)"
-                    ),
-                    status=400,
-                )
+                current_payload, _ = read_alerts_config()
+                watchers = current_payload.get("watchers", {})
+                if not isinstance(watchers, dict):
+                    watchers = {}
+
+                if new_zone_name in watchers:
+                    self._redirect(f"/?warn=Zone+already+exists:+{urllib.parse.quote(new_zone_name)}")
+                    return
+
+                watchers[new_zone_name] = default_watcher(new_zone_name)
+                try:
+                    write_alerts_config({"watchers": watchers})
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._send_html(render_dashboard(message=f"Failed to add zone: {exc}"), status=500)
+                    return
+                self._redirect(f"/?msg=Added+zone:+{urllib.parse.quote(new_zone_name)}")
                 return
+
+            if parsed.path != "/save":
+                self.send_error(404, "Not Found")
+                return
+
+            runtime_settings, _ = read_runtime_settings()
+            if not runtime_settings.get("configured"):
+                self._redirect("/onboarding?warn=Please+complete+Home+Assistant+onboarding+first")
+                return
+            speaker_options, _ = discover_speaker_players(runtime_settings)
+            speaker_entities = {item.get("entity_id", "") for item in speaker_options if item.get("entity_id")}
 
             current_payload, _ = read_alerts_config()
-            watchers = current_payload.get("watchers", {})
-            if not isinstance(watchers, dict):
-                watchers = {}
+            existing_watchers = current_payload.get("watchers", {})
+            if not isinstance(existing_watchers, dict):
+                existing_watchers = {}
 
-            if new_zone_name in watchers:
-                self._redirect(f"/?warn=Zone+already+exists:+{urllib.parse.quote(new_zone_name)}")
-                return
+            merged_watchers, _ = merged_alerts_config()
+            watcher_names = list(merged_watchers.keys())
 
-            watchers[new_zone_name] = default_watcher(new_zone_name)
-            try:
-                write_alerts_config({"watchers": watchers})
-            except Exception as exc:  # pylint: disable=broad-except
-                self._send_html(render_dashboard(message=f"Failed to add zone: {exc}"), status=500)
-                return
-            self._redirect(f"/?msg=Added+zone:+{urllib.parse.quote(new_zone_name)}")
-            return
+            watchers_out: Dict[str, Any] = dict(existing_watchers)
+            parse_errors: List[str] = []
+            for watcher_name in watcher_names:
+                defaults = default_watcher(watcher_name)
 
-        if parsed.path != "/save":
-            self.send_error(404, "Not Found")
-            return
+                def field(name: str, default: str = "") -> str:
+                    return form.get(f"{watcher_name}__{name}", [default])[0].strip()
 
-        runtime_settings, _ = read_runtime_settings()
-        if not runtime_settings.get("configured"):
-            self._redirect("/onboarding?warn=Please+complete+Home+Assistant+onboarding+first")
-            return
-        speaker_options, _ = discover_speaker_players(runtime_settings)
-        speaker_entities = {item.get("entity_id", "") for item in speaker_options if item.get("entity_id")}
+                enabled = f"{watcher_name}__enabled" in form
+                sensor = field("sensor", str(defaults.get("sensor", "")))
+                player = field("player", str(defaults.get("player", "")))
+                if player and "speaker" not in player.lower():
+                    parse_errors.append(f"{watcher_name}: selected player must contain 'speaker'")
+                if speaker_entities and player and player not in speaker_entities:
+                    parse_errors.append(f"{watcher_name}: selected player is not in current speaker device list")
 
-        current_payload, _ = read_alerts_config()
-        existing_watchers = current_payload.get("watchers", {})
-        if not isinstance(existing_watchers, dict):
-            existing_watchers = {}
+                start_hhmm = field("start_hhmm", str(defaults.get("start_hhmm", "2230")))
+                end_hhmm = field("end_hhmm", str(defaults.get("end_hhmm", "0600")))
+                if not hhmm_valid(start_hhmm):
+                    parse_errors.append(f"{watcher_name}: invalid start_hhmm '{start_hhmm}'")
+                if not hhmm_valid(end_hhmm):
+                    parse_errors.append(f"{watcher_name}: invalid end_hhmm '{end_hhmm}'")
 
-        merged_watchers, _ = merged_alerts_config()
-        watcher_names = list(merged_watchers.keys())
-
-        watchers_out: Dict[str, Any] = dict(existing_watchers)
-        parse_errors: List[str] = []
-        for watcher_name in watcher_names:
-            defaults = default_watcher(watcher_name)
-
-            def field(name: str, default: str = "") -> str:
-                return form.get(f"{watcher_name}__{name}", [default])[0].strip()
-
-            enabled = f"{watcher_name}__enabled" in form
-            sensor = field("sensor", str(defaults.get("sensor", "")))
-            player = field("player", str(defaults.get("player", "")))
-            if player and "speaker" not in player.lower():
-                parse_errors.append(f"{watcher_name}: selected player must contain 'speaker'")
-            if speaker_entities and player and player not in speaker_entities:
-                parse_errors.append(f"{watcher_name}: selected player is not in current speaker device list")
-
-            start_hhmm = field("start_hhmm", str(defaults.get("start_hhmm", "2230")))
-            end_hhmm = field("end_hhmm", str(defaults.get("end_hhmm", "0600")))
-            if not hhmm_valid(start_hhmm):
-                parse_errors.append(f"{watcher_name}: invalid start_hhmm '{start_hhmm}'")
-            if not hhmm_valid(end_hhmm):
-                parse_errors.append(f"{watcher_name}: invalid end_hhmm '{end_hhmm}'")
-
-            interval_sec = max(1, parse_int(field("interval_sec", str(defaults.get("interval_sec", 120))), 120))
-            min_on_sec = max(0, parse_int(field("min_on_sec", str(defaults.get("min_on_sec", 5))), 5))
-            idle_poll_sec = max(1, parse_int(field("idle_poll_sec", str(defaults.get("idle_poll_sec", 5))), 5))
-            default_media_content_type = field(
-                "default_media_content_type", str(defaults.get("default_media_content_type", "music"))
-            ) or "music"
-            default_volume = parse_float_optional(
-                field("default_volume", "" if defaults.get("default_volume") is None else str(defaults["default_volume"])),
-                defaults.get("default_volume"),
-            )
-
-            default_audio_file = field("default_audio_file", str(defaults.get("default_audio_file", "")))
-            if default_audio_file.startswith("http://") or default_audio_file.startswith("https://"):
-                url = default_audio_file
-            elif default_audio_file and ALERT_URL_BASE:
-                encoded = "/".join(
-                    urllib.parse.quote(part) for part in default_audio_file.lstrip("/").split("/") if part
-                )
-                url = f"{ALERT_URL_BASE}/{encoded}" if encoded else str(defaults.get("url", ""))
-            elif default_audio_file:
-                url = default_audio_file
-            else:
-                url = str(defaults.get("url", ""))
-
-            raw_time_rules = field("time_rules_json", "[]")
-            try:
-                time_rules = json.loads(raw_time_rules) if raw_time_rules else []
-                if not isinstance(time_rules, list):
-                    raise ValueError("time_rules_json must be a JSON array")
-            except Exception as exc:  # pylint: disable=broad-except
-                parse_errors.append(f"{watcher_name}: invalid time_rules_json ({exc})")
-                time_rules = []
-
-            normalized_rules: List[Dict[str, Any]] = []
-            for idx, rule in enumerate(time_rules):
-                if not isinstance(rule, dict):
-                    parse_errors.append(f"{watcher_name}: rule {idx + 1} is not an object")
-                    continue
-                rs = str(rule.get("start_hhmm", "")).strip()
-                re = str(rule.get("end_hhmm", "")).strip()
-                if not (hhmm_valid(rs) and hhmm_valid(re)):
-                    parse_errors.append(f"{watcher_name}: rule {idx + 1} has invalid HHMM window")
-                    continue
-                normalized_rules.append(
-                    {
-                        "name": str(rule.get("name", f"rule-{idx + 1}")).strip() or f"rule-{idx + 1}",
-                        "start_hhmm": rs,
-                        "end_hhmm": re,
-                        "audio_file": str(rule.get("audio_file", "")).strip(),
-                        "interval_sec": max(1, parse_int(rule.get("interval_sec"), interval_sec)),
-                        "volume": parse_float_optional(rule.get("volume"), default_volume),
-                        "media_content_type": str(rule.get("media_content_type", default_media_content_type)).strip()
-                        or default_media_content_type,
-                        "enabled": parse_bool(rule.get("enabled"), True),
-                    }
+                interval_sec = max(1, parse_int(field("interval_sec", str(defaults.get("interval_sec", 120))), 120))
+                min_on_sec = max(0, parse_int(field("min_on_sec", str(defaults.get("min_on_sec", 5))), 5))
+                idle_poll_sec = max(1, parse_int(field("idle_poll_sec", str(defaults.get("idle_poll_sec", 5))), 5))
+                default_media_content_type = field(
+                    "default_media_content_type", str(defaults.get("default_media_content_type", "music"))
+                ) or "music"
+                default_volume = parse_float_optional(
+                    field("default_volume", "" if defaults.get("default_volume") is None else str(defaults["default_volume"])),
+                    defaults.get("default_volume"),
                 )
 
-            watchers_out[watcher_name] = {
-                "enabled": enabled,
-                "sensor": sensor,
-                "player": player,
-                "start_hhmm": start_hhmm,
-                "end_hhmm": end_hhmm,
-                "interval_sec": interval_sec,
-                "min_on_sec": min_on_sec,
-                "idle_poll_sec": idle_poll_sec,
-                "default_volume": default_volume,
-                "default_media_content_type": default_media_content_type,
-                "default_audio_file": default_audio_file,
-                "url": url,
-                "time_rules": normalized_rules,
-            }
+                default_audio_file = field("default_audio_file", str(defaults.get("default_audio_file", "")))
+                if default_audio_file.startswith("http://") or default_audio_file.startswith("https://"):
+                    url = default_audio_file
+                elif default_audio_file and ALERT_URL_BASE:
+                    encoded = "/".join(
+                        urllib.parse.quote(part) for part in default_audio_file.lstrip("/").split("/") if part
+                    )
+                    url = f"{ALERT_URL_BASE}/{encoded}" if encoded else str(defaults.get("url", ""))
+                elif default_audio_file:
+                    url = default_audio_file
+                else:
+                    url = str(defaults.get("url", ""))
 
-        if parse_errors:
-            message = " | ".join(parse_errors)
-            self._send_html(render_dashboard(message=message), status=400)
-            return
+                raw_time_rules = field("time_rules_json", "[]")
+                try:
+                    time_rules = json.loads(raw_time_rules) if raw_time_rules else []
+                    if not isinstance(time_rules, list):
+                        raise ValueError("time_rules_json must be a JSON array")
+                except Exception as exc:  # pylint: disable=broad-except
+                    parse_errors.append(f"{watcher_name}: invalid time_rules_json ({exc})")
+                    time_rules = []
 
-        try:
-            write_alerts_config({"watchers": watchers_out})
+                normalized_rules: List[Dict[str, Any]] = []
+                for idx, rule in enumerate(time_rules):
+                    if not isinstance(rule, dict):
+                        parse_errors.append(f"{watcher_name}: rule {idx + 1} is not an object")
+                        continue
+                    rs = str(rule.get("start_hhmm", "")).strip()
+                    re = str(rule.get("end_hhmm", "")).strip()
+                    if not (hhmm_valid(rs) and hhmm_valid(re)):
+                        parse_errors.append(f"{watcher_name}: rule {idx + 1} has invalid HHMM window")
+                        continue
+                    normalized_rules.append(
+                        {
+                            "name": str(rule.get("name", f"rule-{idx + 1}")).strip() or f"rule-{idx + 1}",
+                            "start_hhmm": rs,
+                            "end_hhmm": re,
+                            "audio_file": str(rule.get("audio_file", "")).strip(),
+                            "interval_sec": max(1, parse_int(rule.get("interval_sec"), interval_sec)),
+                            "volume": parse_float_optional(rule.get("volume"), default_volume),
+                            "media_content_type": str(rule.get("media_content_type", default_media_content_type)).strip()
+                            or default_media_content_type,
+                            "enabled": parse_bool(rule.get("enabled"), True),
+                        }
+                    )
+
+                watchers_out[watcher_name] = {
+                    "enabled": enabled,
+                    "sensor": sensor,
+                    "player": player,
+                    "start_hhmm": start_hhmm,
+                    "end_hhmm": end_hhmm,
+                    "interval_sec": interval_sec,
+                    "min_on_sec": min_on_sec,
+                    "idle_poll_sec": idle_poll_sec,
+                    "default_volume": default_volume,
+                    "default_media_content_type": default_media_content_type,
+                    "default_audio_file": default_audio_file,
+                    "url": url,
+                    "time_rules": normalized_rules,
+                }
+
+            if parse_errors:
+                message = " | ".join(parse_errors)
+                self._send_html(render_dashboard(message=message), status=400)
+                return
+
+            try:
+                write_alerts_config({"watchers": watchers_out})
+            except Exception as exc:  # pylint: disable=broad-except
+                self._send_html(render_dashboard(message=f"Failed to save config: {exc}"), status=500)
+                return
+
+            self._redirect("/?msg=Saved")
         except Exception as exc:  # pylint: disable=broad-except
-            self._send_html(render_dashboard(message=f"Failed to save config: {exc}"), status=500)
-            return
-
-        self._redirect("/?msg=Saved")
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} admin-error method=POST path={self.path} detail={exc}", flush=True)
+            print(traceback.format_exc(), flush=True)
+            try:
+                self._send_html(f"<h1>Internal Server Error</h1><p>{html.escape(str(exc))}</p>", status=500)
+            except Exception:
+                pass
 
 
 def main():
