@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import base64
+import cgi
 import html
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 import traceback
@@ -637,6 +639,16 @@ def render_dashboard(message: str = "", warning: str = "") -> str:
       </div>
     </form>
     <section class="help">
+      <p class="muted"><strong>Quick Upload</strong></p>
+      <p class="muted">Upload audio files directly here (stored in <code>{html.escape(AUDIO_DIR)}</code>).</p>
+      <form method="post" action="/upload-audio" enctype="multipart/form-data">
+        <div class="actions">
+          <input type="file" name="audio_file" accept=".aiff,.aif,.wav,.mp3,.m4a,.ogg,audio/*" />
+          <button type="submit">Upload Audio</button>
+        </div>
+      </form>
+    </section>
+    <section class="help">
       <p class="muted"><strong>Time Rules JSON format</strong></p>
       <p class="muted">If rules exist, alerts only play when one rule matches current time. Each rule can set a different sound for time-of-day.</p>
       <pre><code>[
@@ -765,6 +777,48 @@ class AdminHandler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             parsed = urllib.parse.urlparse(self.path)
+
+            if parsed.path == "/upload-audio":
+                content_type = self.headers.get("Content-Type", "")
+                if "multipart/form-data" not in content_type:
+                    self._send_html(render_dashboard(message="Upload failed: multipart/form-data required"), status=400)
+                    return
+                try:
+                    form = cgi.FieldStorage(
+                        fp=self.rfile,
+                        headers=self.headers,
+                        environ={
+                            "REQUEST_METHOD": "POST",
+                            "CONTENT_TYPE": content_type,
+                            "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+                        },
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._send_html(render_dashboard(message=f"Upload failed: {exc}"), status=400)
+                    return
+
+                if "audio_file" not in form:
+                    self._send_html(render_dashboard(message="Upload failed: no file provided"), status=400)
+                    return
+                file_field = form["audio_file"]
+                if not getattr(file_field, "filename", ""):
+                    self._send_html(render_dashboard(message="Upload failed: empty filename"), status=400)
+                    return
+                filename = os.path.basename(str(file_field.filename).strip())
+                if filename == "":
+                    self._send_html(render_dashboard(message="Upload failed: invalid filename"), status=400)
+                    return
+                os.makedirs(AUDIO_DIR, exist_ok=True)
+                dest_path = os.path.join(AUDIO_DIR, filename)
+                try:
+                    with open(dest_path, "wb") as out:
+                        shutil.copyfileobj(file_field.file, out)
+                except Exception as exc:  # pylint: disable=broad-except
+                    self._send_html(render_dashboard(message=f"Upload failed: {exc}"), status=500)
+                    return
+                self._redirect(f"/?msg=Uploaded+audio:+{urllib.parse.quote(filename)}")
+                return
+
             content_length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(content_length).decode("utf-8", errors="replace")
             form = urllib.parse.parse_qs(body, keep_blank_values=True)
